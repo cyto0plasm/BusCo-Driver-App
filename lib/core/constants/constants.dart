@@ -241,4 +241,6 @@ class SK {
   static const avatarUrl  = 'avatar_url';
   static const tripId     = 'active_trip_id';
   static const themeMode  = 'theme_mode';
+  static const busStatus       = 'bus_status';
+static const countTripsDaily = 'count_trips_daily';
 }

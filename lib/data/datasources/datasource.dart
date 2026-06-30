@@ -6,19 +6,39 @@ import '../../core/constants/constants.dart';
 import '../../domain/entities/entities.dart';
 
 // ─────────────────────────────────────────────────────────────
-//  DATA SOURCE — confirmed against live schema 2026-03-09
+//  DATA SOURCE — rewritten against confirmed live schema 2026-06-30
 //
 //  REAL COLUMN NAMES:
 //    drivers      : driver_id, name, phone, email, password_hash,
-//                   current_bus_id, wallet_id, license_no, avatar_url
+//                   count_trips_daily, wallet_id, card_uid, license_no,
+//                   avatar_url   (NO current_bus_id — bus link is
+//                   buses.id_driver -> drivers.driver_id)
 //    trips        : trip_id, bus_id, driver_id, active, start_time,
-//                   end_time, list_passengers (jsonb), passenger_count,
-//                   km_per_fare (NOT NULL), location_start (NOT NULL PostGIS)
-//    buses        : bus_id, number_bus, number_line, status (enum),
-//                   gps_lat, gps_lng, gps_updated_at, count_today_trips
-//    wallets      : wallet_id, balance, currency (CHAR — trim!), driver_id
-//    bus_incidents: incident_id, bus_id, by_reported, severity_level (enum),
-//                   description, ts (NOT NULL), reported_at, status
+//                   end_time, fare (flat fare, copied from routes.fare
+//                   at trip start), passenger_count, location_start,
+//                   location_end, distance_total   (NO list_passengers,
+//                   NO km_per_fare, NO route_id)
+//    buses        : bus_id, number_bus, id_driver, route_id, status (enum),
+//                   gps_lat, gps_lng, gps_updated_at, count_today_trips,
+//                   current_trip_id   (NO number_line — that's on routes,
+//                   joined via route_id)
+//    routes       : route_id, name, number_line, fare (route base fare —
+//                   copied into trips.fare at trip start, NOT per-km)
+//    wallets      : wallet_id, balance, currency (CHAR — trim!), driver_id,
+//                   profile_id, shipper_id
+//    bus_incidents: incident_id, bus_id, trip_id, by_reported,
+//                   severity_level (enum incident_severity), description,
+//                   reported_at (NOT ts), status, resolved_at
+//    cards/NFC    : not implemented for driver app yet — passenger
+//                   payment is QR + profiles/wallets, no cards path.
+//
+//  RPCs used (all confirmed live + schema-correct as of this rewrite):
+//    driver_login_email(p_email, p_password)
+//    sp_get_driver_home(p_driver_id)
+//    sp_start_trip(p_bus_id, p_driver_id, p_lat_start, p_lng_start)
+//    sp_end_trip(p_trip_id, p_lat_end, p_lng_end, p_distance_km)
+//    sp_report_incident(p_driver_id, p_severity, p_description)
+//    sp_get_driver_incidents(p_driver_id, p_limit, p_offset)
 // ─────────────────────────────────────────────────────────────
 class DS {
   static final DS _i = DS._();
@@ -35,8 +55,12 @@ class DS {
   Future<Driver> login(String email, String password) async {
     Exception? lastErr;
     for (final pw in [Api.sha256hex(password), password.trim(), password]) {
+        print("EMAIL  : '${email.trim().toLowerCase()}'");
+  print("PASS   : '$pw'");
+  print("LENGTH : ${pw.length}");
+  print(password.codeUnits);
       try {
-        final res = await _api.rpc('driver_login', {
+        final res = await _api.rpc('driver_login_email', {
           'p_email':    email.trim().toLowerCase(),
           'p_password': pw,
         });
@@ -45,7 +69,17 @@ class DS {
         _api.setSession(driver.driverId);
         await _persist(driver);
         return driver;
-      } catch (e) { lastErr = e as Exception?; }
+      } catch (e, st) {
+  print("========== LOGIN ERROR ==========");
+  print(e);
+  print(st);
+
+  if (e is Exception) {
+    lastErr = e;
+  } else {
+    lastErr = Exception(e.toString());
+  }
+}
     }
     throw lastErr ?? const ApiEx('Login failed');
   }
@@ -70,67 +104,9 @@ class DS {
   // ══════════════════════════════════════════════════════════
 
   Future<Driver> refreshDriver(int driverId) async {
-    final rows = await _api.get('drivers', p: {
-      'driver_id': 'eq.$driverId',
-      'select':    'driver_id,name,email,phone,license_no,current_bus_id,wallet_id,avatar_url',
-    }) as List?;
-    if (rows == null || rows.isEmpty) throw const ApiEx('Driver not found');
-    final j = Map<String, dynamic>.from(rows.first as Map);
-
-    final rawBusId    = j['current_bus_id'] as int?;
-    final rawWalletId = j['wallet_id']      as int?;
-
-    final results = await Future.wait([
-      rawBusId != null
-          ? _api.get('buses', p: {
-              'bus_id': 'eq.$rawBusId',
-              'select': 'bus_id,number_bus,number_line,status',
-            }).catchError((_) => null)
-          : Future.value(null),
-      rawWalletId != null
-          ? _api.get('wallets', p: {
-              'wallet_id': 'eq.$rawWalletId',
-              'select':    'wallet_id,balance,currency',
-            }).catchError((_) => null)
-          : Future.value(null),
-      _api.get('wallets', p: {
-        'driver_id': 'eq.$driverId',
-        'select':    'wallet_id,balance,currency',
-        'limit':     '1',
-      }).catchError((_) => null),
-    ]);
-
-    Map<String, dynamic>? bus;
-    final bRes = results[0];
-    if (bRes is List && bRes.isNotEmpty) {
-      bus = Map<String, dynamic>.from(bRes.first as Map);
-    }
-
-    Map<String, dynamic>? wallet;
-    final wRes = results[1];
-    if (wRes is List && wRes.isNotEmpty) {
-      wallet = Map<String, dynamic>.from(wRes.first as Map);
-    } else {
-      final wRes2 = results[2];
-      if (wRes2 is List && wRes2.isNotEmpty) {
-        wallet = Map<String, dynamic>.from(wRes2.first as Map);
-      }
-    }
-
-    final driver = Driver(
-      driverId:   j['driver_id']  as int,
-      name:       (j['name']      as String?) ?? '',
-      email:      (j['email']     as String?) ?? '',
-      phone:      (j['phone']     as String?) ?? '',
-      licenseNo:  j['license_no'] as String?,
-      busId:      bus?['bus_id']       as int?   ?? rawBusId,
-      busNumber:  bus?['number_bus']?.toString(),
-      lineNumber: bus?['number_line']?.toString(),
-      walletId:   wallet?['wallet_id'] as int?  ?? rawWalletId,
-      balance:    double.tryParse((wallet?['balance'] ?? '0').toString()) ?? 0.0,
-      currency:   (wallet?['currency'] as String?)?.trim() ?? 'EGP',
-      avatarUrl:  j['avatar_url'] as String?,
-    );
+    final res = await _api.rpc('sp_get_driver_home', {'p_driver_id': driverId});
+    final j = Map<String, dynamic>.from(res as Map);
+    final driver = _driverFromRpc(j);
     await _persist(driver);
     return driver;
   }
@@ -155,13 +131,11 @@ class DS {
 
   Future<String> uploadAvatar(int driverId, File file) async {
     final url = await _api.uploadImage(file);
-    // Update DB — verify the row was actually updated
     final result = await _api.patch(
       'drivers',
       {'driver_id': 'eq.$driverId'},
       {'avatar_url': url},
     );
-    // If Supabase returned 204 (null) or empty list, patch may not have matched
     if (result is List && result.isEmpty) {
       throw const ApiEx('Avatar URL not saved — driver row not found in DB');
     }
@@ -171,9 +145,6 @@ class DS {
 
   // ══════════════════════════════════════════════════════════
   //  TRIPS
-  //  IMPORTANT:
-
-  //    - passenger_count derived from list_passengers (jsonb) OR column
   // ══════════════════════════════════════════════════════════
 
   Future<Trip?> activeTrip(int busId) async {
@@ -182,64 +153,73 @@ class DS {
       'active': 'eq.true',
       'order':  'trip_id.desc',
       'limit':  '1',
-      'select': 'trip_id,bus_id,driver_id,active,start_time,end_time,'
-                'list_passengers,passenger_count',
+      'select': 'trip_id,bus_id,driver_id,active,start_time,end_time,fare,passenger_count',
     }) as List?;
     if (rows == null || rows.isEmpty) return null;
     return _tripFromJson(Map<String, dynamic>.from(rows.first as Map));
   }
 
- Future<Trip> startTrip({
-  required int busId,
-  required int driverId,
-  required Position position,
-}) async {
-
-  final location =
-      'SRID=4326;POINT(${position.longitude} ${position.latitude})';
-
-
-  final payload = {
-    'bus_id': busId,
-    'driver_id': driverId,
-    'active': true,
-   'start_time': DateTime.now().toUtc().toIso8601String(), 
-    'passenger_count': 0,
-    'location_start': location,
-  };
-
-
-  final rows = await _api.post('trips', payload) as List?;
-
-  
-
-  if (rows == null || rows.isEmpty) {
-    throw const ApiEx('Failed to start trip');
+  Future<Trip> startTrip({
+    required int busId,
+    required int driverId,
+    required Position position,
+  }) async {
+    final res = await _api.rpc('sp_start_trip', {
+      'p_bus_id':    busId,
+      'p_driver_id': driverId,
+      'p_lat_start': position.latitude,
+      'p_lng_start': position.longitude,
+    });
+    final j = Map<String, dynamic>.from(res as Map);
+    if (j['success'] != true) {
+      throw ApiEx((j['message'] as String?) ?? 'Failed to start trip');
+    }
+    final t = Trip(
+      tripId:         j['trip_id'] as int,
+      busId:          busId,
+      driverId:       driverId,
+      active:         true,
+      startTime:      DateTime.now(),
+      passengerCount: 0,
+    );
+    await _s.write(key: SK.tripId, value: t.tripId.toString());
+    return t;
   }
 
-  final map = Map<String, dynamic>.from(rows.first as Map);
-
-
-
-  final t = _tripFromJson(map);
-
-
-  await _s.write(key: SK.tripId, value: t.tripId.toString());
-
-
-  return t;
-}
+  // NOTE: no distance-tracking accumulator exists yet anywhere in this app —
+  // distance_km is sent as 0.0 until that's built. sp_end_trip stores it on
+  // trips.distance_total either way.
   Future<Trip> endTrip(int tripId) async {
-    final rows = await _api.patch(
-      'trips',
-      {'trip_id': 'eq.$tripId'},
-      {'active': false, 'end_time': DateTime.now().toUtc().toIso8601String()},
-    ) as List?;
-    await _s.delete(key: SK.tripId);
-    if (rows == null || rows.isEmpty) {
-      return Trip(tripId: tripId, busId: 0, active: false, startTime: DateTime.now());
+    Position? pos;
+    try {
+      pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.bestForNavigation);
+    } catch (_) { /* fall through with null position */ }
+
+    final res = await _api.rpc('sp_end_trip', {
+      'p_trip_id':     tripId,
+      'p_lat_end':     pos?.latitude  ?? 0.0,
+      'p_lng_end':     pos?.longitude ?? 0.0,
+      'p_distance_km': 0.0,
+    });
+
+    // sp_end_trip has an OUT param (p_status) — PostgREST shape can vary
+    // (object, single-key map, or list-of-one). Parse defensively.
+    String status = 'UNKNOWN';
+    if (res is Map) {
+      status = (res['p_status'] ?? res['status'] ?? res.values.first ?? 'UNKNOWN').toString();
+    } else if (res is List && res.isNotEmpty && res.first is Map) {
+      final m = Map<String, dynamic>.from(res.first as Map);
+      status = (m['p_status'] ?? m['status'] ?? m.values.first ?? 'UNKNOWN').toString();
+    } else if (res is String) {
+      status = res;
     }
-    return _tripFromJson(Map<String, dynamic>.from(rows.first as Map));
+    if (status != 'SUCCESS') {
+      throw ApiEx('Failed to end trip: $status');
+    }
+
+    await _s.delete(key: SK.tripId);
+    return Trip(tripId: tripId, busId: 0, active: false, startTime: DateTime.now());
   }
 
   Future<int?> storedTripId() async =>
@@ -254,8 +234,7 @@ class DS {
       'driver_id': 'eq.$driverId',
       'order':     'trip_id.desc',
       'limit':     '$limit',
-      'select':    'trip_id,bus_id,driver_id,active,start_time,end_time,'
-                   'list_passengers,passenger_count',
+      'select':    'trip_id,bus_id,driver_id,active,start_time,end_time,passenger_count',
     }) as List? ?? [];
 
     final summaries = <TripSummary>[];
@@ -275,7 +254,7 @@ class DS {
         busId:          j['bus_id'] as int,
         startTime:      DateTime.tryParse(j['start_time']?.toString() ?? '') ?? DateTime.now(),
         endTime:        j['end_time'] != null ? DateTime.tryParse(j['end_time'].toString()) : null,
-        passengerCount: _paxCount(j),
+        passengerCount: (j['passenger_count'] as int?) ?? 0,
         totalCollected: total,
         active:         j['active'] == true,
       ));
@@ -289,14 +268,14 @@ class DS {
     final rows = await _api.get('trips', p: {
       'driver_id':  'eq.$driverId',
       'start_time': 'gte.$start',
-      'select':     'trip_id,list_passengers,passenger_count',
+      'select':     'trip_id,passenger_count',
     }) as List? ?? [];
 
     int pax = 0;
     double collected = 0.0;
     for (final r in rows) {
       final j = Map<String, dynamic>.from(r as Map);
-      pax += _paxCount(j);
+      pax += (j['passenger_count'] as int?) ?? 0;
       try {
         final txns = await _api.get('transactions', p: {
           'trip_id': 'eq.${j['trip_id']}', 'type': 'eq.DEBIT', 'select': 'fare',
@@ -315,7 +294,7 @@ class DS {
       'driver_id':  'eq.$driverId',
       'start_time': 'gte.${start.toIso8601String()}',
       'order':      'start_time.asc',
-      'select':     'trip_id,start_time,list_passengers,passenger_count',
+      'select':     'trip_id,start_time,passenger_count',
     }) as List? ?? [];
 
     final Map<String, List<Map>> grouped = {};
@@ -352,10 +331,12 @@ class DS {
   // ══════════════════════════════════════════════════════════
 
   Future<BusInfo?> busInfo(int busId) async {
+    // number_line lives on routes, not buses — use PostgREST resource
+    // embedding via the buses.route_id -> routes.route_id FK.
     final rows = await _api.get('buses', p: {
       'bus_id': 'eq.$busId',
-      'select': 'bus_id,number_bus,number_line,status,'
-                'gps_lat,gps_lng,gps_updated_at,count_today_trips',
+      'select': 'bus_id,number_bus,status,gps_lat,gps_lng,gps_updated_at,'
+                'count_today_trips,routes(number_line)',
     }) as List?;
     if (rows == null || rows.isEmpty) return null;
     return _busFromJson(Map<String, dynamic>.from(rows.first as Map));
@@ -396,96 +377,47 @@ class DS {
 
   // ══════════════════════════════════════════════════════════
   //  INCIDENTS
-  //  severity_level is a Postgres enum — cast to TEXT on insert
-  //  'ts' is NOT NULL; 'reported_at' nullable
   // ══════════════════════════════════════════════════════════
 
   Future<void> reportIncident({
-    required int    busId,
+    required int    busId, // kept for call-site compat; sp_report_incident
+                            // derives the bus from the driver server-side
     required int    driverId,
     required String severity,
     required String description,
   }) async {
-    await _api.post('bus_incidents', {
-      'bus_id':         busId,
-      'by_reported':    'driver:$driverId',
-      'severity_level': severity,
-      'description':    description,
+    final res = await _api.rpc('sp_report_incident', {
+      'p_driver_id':   driverId,
+      'p_severity':    severity,
+      'p_description': description,
     });
-
-    if (severity == 'HIGH') await setBusStatus(busId, 'BROKEN');
+    final j = Map<String, dynamic>.from(res as Map);
+    if (j['success'] != true) {
+      throw ApiEx((j['error'] as String?) ?? 'Failed to report incident');
+    }
   }
 
   Future<List<Incident>> myIncidents(int driverId, int busId) async {
     try {
-      final rows = await _api.get('bus_incidents', p: {
-        'bus_id': 'eq.$busId',
-        'order':  'ts.desc',
-        'limit':  '20',
-        'select': 'incident_id,bus_id,severity_level,description,ts,reported_at,status',
-      }) as List? ?? [];
+      final res = await _api.rpc('sp_get_driver_incidents', {
+        'p_driver_id': driverId,
+        'p_limit':     20,
+        'p_offset':    0,
+      });
+      final j = Map<String, dynamic>.from(res as Map);
+      final rows = (j['incidents'] as List?) ?? [];
       return rows.map((r) {
-        final j     = Map<String, dynamic>.from(r as Map);
-        final tsStr = j['ts']?.toString() ?? j['reported_at']?.toString();
+        final m = Map<String, dynamic>.from(r as Map);
         return Incident(
-          incidentId:  j['incident_id'] as int,
-          busId:       j['bus_id']      as int,
-          severity:    _severityFromStr(j['severity_level']?.toString() ?? 'LOW'),
-          description: (j['description'] as String?) ?? '',
-          reportedAt:  DateTime.tryParse(tsStr ?? '') ?? DateTime.now(),
-          status:      (j['status'] as String?) ?? 'OPEN',
+          incidentId:  m['incident_id'] as int,
+          busId:       m['bus_id']      as int,
+          severity:    _severityFromStr((m['severity'] as String?) ?? 'LOW'),
+          description: (m['description'] as String?) ?? '',
+          reportedAt:  DateTime.tryParse(m['reported_at']?.toString() ?? '') ?? DateTime.now(),
+          status:      (m['status'] as String?) ?? 'OPEN',
         );
       }).toList();
     } catch (_) { return []; }
-  }
-
-  // ══════════════════════════════════════════════════════════
-  //  NFC / CARD
-  // ══════════════════════════════════════════════════════════
-
-  Future<ScannedPassenger?> lookupCard(String uid) async {
-    final cards = await _api.get('cards', p: {
-      'uid': 'eq.$uid', 'select': 'uid,blocked,user_id',
-    }) as List?;
-    if (cards == null || cards.isEmpty) return null;
-    final card   = Map<String, dynamic>.from(cards.first as Map);
-    final userId = card['user_id'] as int?;
-    if (userId == null) return null;
-
-    final users = await _api.get('users', p: {
-      'user_id': 'eq.$userId',
-      'select':  'user_id,name,phone,wallets(wallet_id,balance,currency)',
-    }) as List?;
-    if (users == null || users.isEmpty) return null;
-    final u  = Map<String, dynamic>.from(users.first as Map);
-    final wl = u['wallets'] as List?;
-    if (wl == null || wl.isEmpty) return null;
-    final w  = Map<String, dynamic>.from(wl.first as Map);
-    return ScannedPassenger(
-      userId:      u['user_id']   as int,
-      name:        u['name']      as String,
-      phone:       u['phone']     as String?,
-      walletId:    w['wallet_id'] as int,
-      balance:     double.tryParse(w['balance']?.toString() ?? '0') ?? 0.0,
-      currency:    (w['currency'] as String?)?.trim() ?? 'EGP',
-      cardUid:     card['uid']    as String,
-      cardBlocked: card['blocked'] == true,
-    );
-  }
-
-  Future<void> deductFare({
-    required int    walletId,
-    required double currentBalance,
-    required double fare,
-    required int    tripId,
-  }) async {
-    if (currentBalance < fare) throw const ApiEx('Insufficient balance');
-    await _api.patch('wallets', {'wallet_id': 'eq.$walletId'}, {'balance': currentBalance - fare});
-    await _api.post('transactions', {
-      'wallet_id': walletId, 'fare': fare,
-      'type': 'DEBIT', 'method_payment': 'NFC',
-      'trip_id': tripId, 'ts': DateTime.now().toIso8601String(),
-    });
   }
 
   // ══════════════════════════════════════════════════════════
@@ -548,25 +480,28 @@ class DS {
   }
 
   Trip _tripFromJson(Map<String, dynamic> j) => Trip(
-  tripId:         j['trip_id']   as int,
-  busId:          j['bus_id']    as int,
-  driverId:       j['driver_id'] as int?,
-  active:         j['active'] == true,
-  startTime:      DateTime.tryParse(j['start_time']?.toString() ?? '')?.toLocal() ?? DateTime.now(),
-  endTime:        j['end_time'] != null ? DateTime.tryParse(j['end_time'].toString())?.toLocal() : null,
-  passengerCount: _paxCount(j),
-);
-
-  BusInfo _busFromJson(Map<String, dynamic> j) => BusInfo(
-    busId:          j['bus_id']     as int,
-    busNumber:      j['number_bus']?.toString()  ?? '',
-    lineNumber:     j['number_line']?.toString(),
-    status:         BusStatusX.fromString(j['status']?.toString() ?? 'IDLE'),
-    gpsLat:         j['gps_lat']   != null ? double.tryParse(j['gps_lat'].toString()) : null,
-    gpsLng:         j['gps_lng']   != null ? double.tryParse(j['gps_lng'].toString()) : null,
-    gpsUpdatedAt:   j['gps_updated_at'] != null ? DateTime.tryParse(j['gps_updated_at'].toString()) : null,
-    countTodayTrips: (j['count_today_trips'] as int?) ?? 0,
+    tripId:         j['trip_id']   as int,
+    busId:          j['bus_id']    as int,
+    driverId:       j['driver_id'] as int?,
+    active:         j['active'] == true,
+    startTime:      DateTime.tryParse(j['start_time']?.toString() ?? '')?.toLocal() ?? DateTime.now(),
+    endTime:        j['end_time'] != null ? DateTime.tryParse(j['end_time'].toString())?.toLocal() : null,
+    passengerCount: (j['passenger_count'] as int?) ?? 0,
   );
+
+  BusInfo _busFromJson(Map<String, dynamic> j) {
+    final route = j['routes'] as Map<String, dynamic>?;
+    return BusInfo(
+      busId:          j['bus_id']     as int,
+      busNumber:      j['number_bus']?.toString()  ?? '',
+      lineNumber:     route?['number_line']?.toString(),
+      status:         BusStatusX.fromString(j['status']?.toString() ?? 'IDLE'),
+      gpsLat:         j['gps_lat']   != null ? double.tryParse(j['gps_lat'].toString()) : null,
+      gpsLng:         j['gps_lng']   != null ? double.tryParse(j['gps_lng'].toString()) : null,
+      gpsUpdatedAt:   j['gps_updated_at'] != null ? DateTime.tryParse(j['gps_updated_at'].toString()) : null,
+      countTodayTrips: (j['count_today_trips'] as int?) ?? 0,
+    );
+  }
 
   WalletTx _txFromJson(Map<String, dynamic> j) {
     final typeStr = (j['type'] as String? ?? '').toUpperCase();
@@ -591,13 +526,4 @@ class DS {
     'MEDIUM' => IncidentSeverity.medium,
     _        => IncidentSeverity.low,
   };
-
-  // Passenger count — prefers integer column, falls back to jsonb array length
-  int _paxCount(Map<String, dynamic> j) {
-    final fromCol = j['passenger_count'] as int?;
-    if (fromCol != null && fromCol > 0) return fromCol;
-    final list = j['list_passengers'];
-    if (list is List) return list.length;
-    return 0;
-  }
 }

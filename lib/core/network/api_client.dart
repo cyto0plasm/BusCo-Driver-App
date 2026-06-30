@@ -54,6 +54,8 @@ class Api {
         case 'GET':
           res = await http.get(uri, headers: _headers).timeout(const Duration(seconds: 20));
         case 'POST':
+        print(uri);
+print(jsonEncode(body));
           res = await http.post(uri, headers: _headers, body: jsonEncode(body ?? {}))
               .timeout(const Duration(seconds: 20));
         case 'PATCH':
@@ -70,6 +72,8 @@ class Api {
     }
     if (res.statusCode == 204) return null;
     final decoded = jsonDecode(res.body);
+    print("STATUS = ${res.statusCode}");
+print("BODY   = ${res.body}");
     if (res.statusCode < 200 || res.statusCode >= 300) {
       final m = decoded is Map
           ? (decoded['message'] ?? decoded['hint'] ?? decoded['error'] ?? 'Error')

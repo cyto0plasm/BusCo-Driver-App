@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:busco_driver/domain/entities/entities.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:image_picker/image_picker.dart';
@@ -22,7 +23,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _name.dispose(); _phone.dispose(); _license.dispose(); super.dispose();
   }
 
-  void _startEditing(dynamic driver) {
+  void _startEditing(Driver driver) {
     _name.text    = driver.name;
     _phone.text   = driver.phone;
     _license.text = driver.licenseNo ?? '';
@@ -124,7 +125,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
 // ── HERO — premium navy banner ────────────────────────────────
 class _ProfileHero extends StatelessWidget {
-  final dynamic driver;
+  final Driver driver;
   final String? localAvatar;
   final bool editing, isDark;
   final C c;
@@ -433,7 +434,7 @@ class _Badge extends StatelessWidget {
 // ── INFO SECTION ─────────────────────────────────────────────
 class _InfoSection extends StatelessWidget {
   final C c;
-  final dynamic driver;
+  final Driver driver;
   const _InfoSection({required this.c, required this.driver});
 
   @override
@@ -517,7 +518,7 @@ class _InfoRow extends StatelessWidget {
 class _EditSection extends StatelessWidget {
   final C c;
   final TextEditingController name, phone, license;
-  final dynamic driver;
+  final Driver driver;
   const _EditSection({required this.c, required this.name,
     required this.phone, required this.license, required this.driver});
 
@@ -560,7 +561,7 @@ class _EditSection extends StatelessWidget {
 // ── WALLET SECTION ───────────────────────────────────────────
 class _WalletSection extends StatelessWidget {
   final C c;
-  final dynamic driver;
+  final Driver driver;
   const _WalletSection({required this.c, required this.driver});
 
   @override
